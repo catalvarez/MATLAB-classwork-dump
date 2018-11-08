@@ -1,0 +1,206 @@
+function [h1]=nexthTG3(h0,u0,u1,dudt,a0,a1,dt,theta,gamma,coordinates,connectivity,nip,MFC,A,blambda)
+
+    %% solves dh/dt+d( u h)/dx=a for h (where u and a are given)
+    % using a third-order Taylor-Galerkin method
+    % h1 is the ice thickeess at the end to the time step, 
+    % h0 is the ice thickness at the beginning of the time step
+    %
+    % vectorized and sparse version
+
+    
+    Nnodes=max(connectivity(:)); [Nele,nod]=size(connectivity);
+    ndim=1; dof=1; neq=dof*Nnodes;
+    
+    
+    h0nod=reshape(h0(connectivity,1),Nele,nod);
+    u0nod=reshape(u0(connectivity,1),Nele,nod);   % Nele x nod
+    u1nod=reshape(u1(connectivity,1),Nele,nod);
+    a0nod=reshape(a0(connectivity,1),Nele,nod);
+    a1nod=reshape(a1(connectivity,1),Nele,nod);
+    dudtnod=reshape(dudt(connectivity,1),Nele,nod);
+    [points,weights]=sample(ndim,nip,nod);
+    
+    
+    kv=sparse(neq,neq);
+    d1d1=zeros(Nele,nod,nod);
+    b1=zeros(Nele,nod);
+    
+    
+    for Iint=1:nip
+        
+        
+        fun=shape_fun(Iint,ndim,nod,points) ;
+        [Deriv,detJ]=derivVector1d(coordinates,connectivity,nip,Iint);
+        
+        
+        h0int=h0nod*fun;
+        u0int=u0nod*fun;
+        a0int=a0nod*fun;
+        u1int=u1nod*fun;
+        a1int=a1nod*fun;
+        dudtint=dudtnod*fun;
+        
+        du1dx=zeros(Nele,1); du0dx=zeros(Nele,1); dh0dx=zeros(Nele,1);
+        da0dx=zeros(Nele,1);da1dx=zeros(Nele,1);
+        
+        for Inod=1:nod
+            du1dx=du1dx+Deriv(:,1,Inod).*u1nod(:,Inod);
+            du0dx=du0dx+Deriv(:,1,Inod).*u0nod(:,Inod);
+            dh0dx=dh0dx+Deriv(:,1,Inod).*h0nod(:,Inod);
+            da0dx=da0dx+Deriv(:,1,Inod).*a0nod(:,Inod);
+            da1dx=da1dx+Deriv(:,1,Inod).*a1nod(:,Inod);
+        end
+        
+        detJw=detJ*weights(Iint);
+        
+        
+        
+        for Inod=1:nod
+            for Jnod=1:nod
+                
+                h1term=fun(Jnod).*fun(Inod).*detJw;
+                hdxu1=dt*theta*du1dx.*fun(Jnod).*fun(Inod).*detJw;
+                udxh1=dt*theta*u1int.*Deriv(:,1,Jnod).*fun(Inod).*detJw;
+                
+                
+                u1u1dh1dx=-u1int.*u1int.*Deriv(:,1,Inod).*Deriv(:,1,Jnod).*detJw;
+                u1du1dxh1=-u1int.*du1dx.*fun(Jnod).*Deriv(:,1,Inod).*detJw;
+                
+                du1dth1=dudtint.*fun(Jnod).*Deriv(:,1,Inod).*detJw;
+                
+                
+                corr=dt^2*(u1u1dh1dx+u1du1dxh1+du1dth1)/12;
+                
+                d1d1(:,Inod,Jnod)=d1d1(:,Inod,Jnod)+h1term+hdxu1+udxh1+theta*gamma*corr;
+                
+                
+            end
+            
+            h0term=h0int.*fun(Inod).*detJw;
+            a0term=dt*(1-theta)*a0int.*fun(Inod).*detJw;
+            a1term=dt*theta*a1int.*fun(Inod).*detJw;
+            
+            hdxu0=-dt*(1-theta)*du0dx.*h0int.*fun(Inod).*detJw;
+            udxh0=-dt*(1-theta)*dh0dx.*u0int.*fun(Inod).*detJw;
+            
+            % 2nd and 3rd order terms
+            
+            du0dth0=dudtint.*h0int.*Deriv(:,1,Inod);
+            u0du0dxh0=-u0int.*du0dx.*h0int.*Deriv(:,1,Inod);
+            u0u0dh0dx=-u0int.*u0int.*dh0dx.*Deriv(:,1,Inod);
+            
+            
+            u0a0=u0int.*a0int.*Deriv(:,1,Inod);
+            u1a1=-u1int.*a1int.*Deriv(:,1,Inod);
+            corrhs=dt^2*(u0a0+u1a1+u0du0dxh0+u0u0dh0dx+du0dth0).*detJw/12;
+            
+            
+            b1(:,Inod)=b1(:,Inod)+h0term+a0term+a1term+hdxu0+udxh0+(1-theta)*gamma*corrhs;
+        end
+    end
+    
+    rh=sparse(neq,1);
+    for Inod=1:nod
+        
+        rh=rh+sparse(connectivity(:,Inod),ones(Nele,1),b1(:,Inod),neq,1);
+        
+        
+    end
+    
+    for Inod=1:nod
+        for Jnod=1:nod
+            kv=kv+sparse(connectivity(:,Inod),connectivity(:,Jnod),d1d1(:,Inod,Jnod),neq,neq);
+            
+        end
+    end
+    
+    
+    % Boundary term corrections need for the method of characteristics
+    
+    % [---------------   Boundary terms from the correction integral
+    % I assume that I can evaluate the derivative at end nodes at closest integration point
+    %
+    
+    if gamma==1
+        Iele=1 ; Iint=1;
+        der=shape_der(Iint,ndim,nod,points);
+        coord=coordinates(connectivity(Iele,1:end));
+        J=der*coord;
+        iJ=1/J;
+        deriv=iJ*der;
+        h0_l=h0(connectivity(Iele,1:end));  % nod x 1
+        u0_l=u0(connectivity(Iele,1:end));
+        u1_l=u1(connectivity(Iele,1:end));
+        
+        du1dx=deriv*u1_l ;  % the derivatives are at integration point
+        
+        du0dx=deriv*u0_l ;   dh0dx=deriv*h0_l;
+        rh(1)=rh(1)-(1-theta)*u0(1)*du0dx*h0(1)*dt^2/12;
+        kv(1,1)=kv(1,1)+theta*u1(1)*du1dx*dt^2/12;
+        
+        
+        rh(1)=rh(1)-(1-theta)*u0(1)^2*dh0dx*dt^2/12;
+        kv(1,1:nod)=kv(1,1:nod)+theta*u1(1)^2*deriv*dt^2/12;
+        
+        
+        
+        Iele=Nele ; Iint=nip;
+        der=shape_der(Iint,ndim,nod,points);  % 1 x nod  : dNdXi (derivatives of formfunctions with respect to local coordinates at inegration poitns)
+        coord=coordinates(connectivity(Iele,1:end));
+        J=der*coord;                           % Jacobian
+        %iJ=inv(J);
+        iJ=1/J;
+        deriv=iJ*der;                          % derivatives of form functions with respecty to global coordinates
+        h0_l=h0(connectivity(Iele,1:end));  % nod x 1
+        u0_l=u0(connectivity(Iele,1:end));
+        u1_l=u1(connectivity(Iele,1:end));
+        
+        du0dx=deriv*u0_l ; du1dx=deriv*u1_l ;dh0dx=deriv*h0_l;
+        rh(Nnodes)=rh(Nnodes)+gamma*(1-theta)*u0(Nnodes)*du0dx*h0(Nnodes)*dt^2/12;
+        rh(Nnodes)=rh(Nnodes)+gamma*(1-theta)*u0(Nnodes)^2*dh0dx*dt^2/12;
+        kv(Nnodes,Nnodes)=kv(Nnodes,Nnodes)-gamma*theta*u1(Nnodes)*du1dx*dt^2/12;
+        kv(Nnodes,Nnodes-nod+1:Nnodes)=kv(Nnodes,Nnodes-nod+1:Nnodes)-gamma*theta*u1(Nnodes)^2*deriv*dt^2/12;
+        
+        
+    end
+    
+    
+    
+    
+    
+    
+    if MFC==1  % Lagrange
+        
+        [nA,mA]=size(A); 
+        %A=A*1e6 ; blambda=blambda*1e6; ; mean(abs(diag(kv)))
+        kv=[kv A' ; A zeros(nA,nA)]; rh=[rh ; blambda] ;
+        
+    elseif MFC==2 % penalty method
+        k=ceil(log10(max(abs(diag(kv))))); p=10^(k+8);
+        [na,nb]=size(A);
+        
+        %kv(1,1)=kv(1,1)+p ; kv(1,2)=kv(1,2)-p ;  kv(2,1)=kv(2,1)-p ;  kv(2,2)=kv(2,2)+p ;
+        %kv(1,1)=kv(1,1)+p ; kv(1,3)=kv(1,3)-p ;  kv(3,1)=kv(3,1)-p ;  kv(3,3)=kv(3,3)+p ;
+        
+        for I=1:na
+            kv(A(I,1),A(I,1))=kv(A(I,1),A(I,1))+p ;
+            kv(A(I,1),A(I,2))=kv(A(I,1),A(I,2))-p ;
+            kv(A(I,2),A(I,1))=kv(A(I,2),A(I,1))-p ;
+            kv(A(I,2),A(I,2))=kv(A(I,2),A(I,2))+p ;
+            rh(A(I,1))=rh(A(I,1))+p*blambda(I);
+            rh(A(I,2))=rh(A(I,2))-p*blambda(I);
+            
+        end
+        
+    end
+    
+    
+    
+    sol=kv\rh;
+    h1=sol(1:neq);
+    
+    
+end
+
+
+
